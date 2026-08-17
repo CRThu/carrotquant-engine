@@ -8,6 +8,7 @@ version = "1.1.0"
 description = "High-performance 1m+ Numba event-driven quantitative backtesting engine for A-share full-market trading"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
     "numba>=0.60.0",
     "numpy>=1.26.0",
