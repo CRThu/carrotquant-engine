@@ -286,3 +286,25 @@ def test_adj_market_data_explicit_views():
     empty_adj = AdjMarketData()
     with pytest.raises(AttributeError):
         _ = empty_adj.close
+
+
+def test_matrix_builder_partial_universe_alignment():
+    """测试当 DataFrame 包含标的池之外的代码时 (partial universe)，正确执行过滤且不产生类型错误"""
+    df = pl.DataFrame({
+        "timestamp": [1704067200000, 1704067200000, 1704067200000],
+        "symbol": ["000001.SZ", "999999.SZ", "600000.SH"],  # 包含外部代码 999999.SZ
+        "open": [10.0, 99.0, 20.0],
+        "high": [11.0, 100.0, 21.0],
+        "low": [9.5, 98.0, 19.5],
+        "close": [10.2, 99.5, 20.2],
+    })
+
+    master_timestamps = np.array([1704067200000], dtype=np.int64)
+    master_symbols = ["000001.SZ", "600000.SH"]
+
+    data = build_market_data_from_df(df, all_timestamps=master_timestamps, all_symbols=master_symbols)
+
+    assert data.shape == (1, 2)
+    assert data.symbols == ["000001.SZ", "600000.SH"]
+    np.testing.assert_allclose(data.close, [[10.2, 20.2]])
+    np.testing.assert_allclose(data.open, [[10.0, 20.0]])

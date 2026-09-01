@@ -448,13 +448,13 @@ def _align_df_to_grid(
     })
     df_mapped = df_with_ts.select(["symbol", "_std_ts"]).join(sym_map, on="symbol", how="left")
 
-    s_idx = df_mapped["_s_idx"].to_numpy()
+    s_idx = df_mapped["_s_idx"].fill_null(-1).to_numpy().astype(np.int64)
     df_ts = df_mapped["_std_ts"].to_numpy().astype(np.int64)
     t_idx = np.searchsorted(all_timestamps, df_ts)
 
     # 4. 计算有效掩码与 1D 展平物理索引 (flat_idx = t * N + s)
     valid_mask = (s_idx >= 0) & (t_idx < n_steps) & (all_timestamps[np.clip(t_idx, 0, n_steps - 1)] == df_ts)
-    flat_idx = t_idx[valid_mask] * n_symbols + s_idx[valid_mask]
+    flat_idx = (t_idx[valid_mask] * n_symbols + s_idx[valid_mask]).astype(np.int64)
 
     return all_timestamps, all_symbols, flat_idx, valid_mask
 
