@@ -4,7 +4,7 @@ CarrotQuant Engine (cq.engine)
 高性能全市场 Numba 事件驱动量化回测与撮合引擎。
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 from cq.engine.runner import Engine
 from cq.engine.matching import MatchingMode
