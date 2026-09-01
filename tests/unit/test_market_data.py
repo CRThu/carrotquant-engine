@@ -30,7 +30,6 @@ def test_market_data_unadjusted_and_adjusted_views():
         high_price=high_p,
         low_price=low_p,
         close_price=raw_close,
-        raw_close_price=raw_close,
         adj_close_price=adj_close,
         adj_open_price=adj_open,
         adj_high_price=adj_high,
@@ -42,7 +41,6 @@ def test_market_data_unadjusted_and_adjusted_views():
 
     # 真实交易价格
     np.testing.assert_array_equal(data.close, raw_close)
-    np.testing.assert_array_equal(data.raw_close, raw_close)
 
     # 复权视图价格
     np.testing.assert_array_equal(data.adj.close, adj_close)

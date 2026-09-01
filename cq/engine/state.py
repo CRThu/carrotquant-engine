@@ -37,10 +37,6 @@ class EngineState:
         self.trade_logs = np.zeros((max_trades, 7), dtype=np.float64)
         self.trade_count = np.array([0], dtype=np.int64)  # 使用 1D numpy array 存储计数器以方便 Numba JIT 引用传参
 
-    @property
-    def n_stocks(self) -> int:
-        """向后兼容属性"""
-        return self.n_symbols
 
     def reset(self):
         """重置状态"""

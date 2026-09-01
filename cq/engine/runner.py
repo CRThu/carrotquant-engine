@@ -2,14 +2,15 @@
 Engine: 回测引擎主入口与 Bar 循环调度器
 
 连接行情数据、SoA 状态数组、撮合核算子与策略逻辑。
-提供统一的 Stream-Native 回测调度入口 engine.run()。
+提供统一的 Stream-Native 回测调度入口 engine.run()，支持统一 Dict 传参与 Duck Typing 数据协议。
 """
 
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Any, Callable, Generator, Iterable, Iterator, List, Optional, Union
 import numpy as np
 from numba import njit
 
 from cq.engine.feed.column_loader import MarketData
+from cq.engine.feed.feed_loader import load_feed, stream_feed
 from cq.engine.state import EngineState
 from cq.engine.matching import (
     execute_trade_jit,
@@ -29,7 +30,6 @@ def run_engine_jit_kernel(
     high_mat: np.ndarray,
     low_mat: np.ndarray,
     close_mat: np.ndarray,
-    raw_close_mat: np.ndarray,
     volume_mat: np.ndarray,
     amount_mat: np.ndarray,
     is_tradable_mat: np.ndarray,
@@ -49,27 +49,82 @@ def run_engine_jit_kernel(
     trade_count: np.ndarray,
     max_volume_ratio: float = 1.0,
     adj_open_mat: np.ndarray = None,
+    adj_close_mat: np.ndarray = None,
     long_margin_ratio: float = 1.0,
     short_margin_ratio: float = 1.0,
+    warmup_steps: int = 0,
 ):
     """
     全 JIT 内核化主 Bar 循环 (Full JIT Loop Kernel)
     """
     n_steps, n_symbols = open_mat.shape
     adj_open = adj_open_mat if adj_open_mat is not None else open_mat
+    adj_close = adj_close_mat if adj_close_mat is not None else close_mat
 
     for t in range(n_steps):
-        # 1. 扫描与撮合
-        if matching_mode == MATCHING_MODE_OPEN:
-            # OPEN 撮合模式：t 步在开盘按 open_mat[t, i] 撮合 t-1 步产生的信号 (防止偷看当 Bar Close 买当 Bar Open)
-            if t > 0:
+        is_warmup = (t < warmup_steps)
+
+        # 1. 扫描与撮合 (预热期不撮合)
+        if not is_warmup:
+            if matching_mode == MATCHING_MODE_OPEN:
+                # OPEN 撮合模式：t 步在开盘按 open_mat[t, i] 撮合 t-1 步产生的信号
+                if t > 0 and (t - 1) >= warmup_steps:
+                    for i in range(n_symbols):
+                        sig = signals_mat[t - 1, i]
+                        if sig != 0 and is_tradable_mat[t, i]:
+                            amt = amounts_mat[t - 1, i]
+                            if amt > 0:
+                                raw_p = open_mat[t, i]
+                                adj_p = adj_open[t, i]
+                                vol_val = volume_mat[t, i] if volume_mat is not None else 0.0
+
+                                execute_trade_jit(
+                                    step_idx=t,
+                                    symbol_idx=i,
+                                    side=int(sig),
+                                    target_amount=amt,
+                                    raw_price=raw_p,
+                                    adj_price=adj_p,
+                                    fee_rate=fee_rate,
+                                    min_fee=min_fee,
+                                    stamp_duty=stamp_duty,
+                                    slippage=slippage,
+                                    positions=positions,
+                                    avg_costs=avg_costs,
+                                    cash_arr=cash_arr,
+                                    trade_logs=trade_logs,
+                                    trade_count=trade_count,
+                                    volume=vol_val,
+                                    max_volume_ratio=max_volume_ratio,
+                                    long_margin_ratio=long_margin_ratio,
+                                    short_margin_ratio=short_margin_ratio,
+                                )
+            else:
+                # 当 Bar 撮合模式 (CLOSE / VWAP / TWAP)
                 for i in range(n_symbols):
-                    sig = signals_mat[t - 1, i]
+                    sig = signals_mat[t, i]
                     if sig != 0 and is_tradable_mat[t, i]:
-                        amt = amounts_mat[t - 1, i]
+                        amt = amounts_mat[t, i]
                         if amt > 0:
-                            raw_p = open_mat[t, i]
-                            adj_p = adj_open[t, i]
+                            raw_p = get_execution_price(
+                                matching_mode,
+                                open_mat[t, i],
+                                high_mat[t, i],
+                                low_mat[t, i],
+                                close_mat[t, i],
+                                volume_mat[t, i],
+                                amount_mat[t, i],
+                            )
+                            adj_p = get_execution_price(
+                                matching_mode,
+                                adj_open[t, i],
+                                high_mat[t, i],
+                                low_mat[t, i],
+                                adj_close[t, i],
+                                volume_mat[t, i],
+                                amount_mat[t, i],
+                            )
+
                             vol_val = volume_mat[t, i] if volume_mat is not None else 0.0
 
                             execute_trade_jit(
@@ -93,56 +148,6 @@ def run_engine_jit_kernel(
                                 long_margin_ratio=long_margin_ratio,
                                 short_margin_ratio=short_margin_ratio,
                             )
-        else:
-            # 当 Bar 撮合模式 (CLOSE / VWAP / TWAP)
-            for i in range(n_symbols):
-                sig = signals_mat[t, i]
-                if sig != 0 and is_tradable_mat[t, i]:
-                    amt = amounts_mat[t, i]
-                    if amt > 0:
-                        raw_p = get_execution_price(
-                            matching_mode,
-                            open_mat[t, i],
-                            high_mat[t, i],
-                            low_mat[t, i],
-                            raw_close_mat[t, i],
-                            volume_mat[t, i],
-                            amount_mat[t, i],
-                        )
-                        adj_p = get_execution_price(
-                            matching_mode,
-                            adj_open[t, i],
-                            high_mat[t, i],
-                            low_mat[t, i],
-                            close_mat[t, i],
-                            volume_mat[t, i],
-                            amount_mat[t, i],
-                        )
-
-                        vol_val = volume_mat[t, i] if volume_mat is not None else 0.0
-
-                        execute_trade_jit(
-                            step_idx=t,
-                            symbol_idx=i,
-                            side=int(sig),
-                            target_amount=amt,
-                            raw_price=raw_p,
-                            adj_price=adj_p,
-                            fee_rate=fee_rate,
-                            min_fee=min_fee,
-                            stamp_duty=stamp_duty,
-                            slippage=slippage,
-                            positions=positions,
-                            avg_costs=avg_costs,
-                            cash_arr=cash_arr,
-                            trade_logs=trade_logs,
-                            trade_count=trade_count,
-                            volume=vol_val,
-                            max_volume_ratio=max_volume_ratio,
-                            long_margin_ratio=long_margin_ratio,
-                            short_margin_ratio=short_margin_ratio,
-                        )
-
 
         # 2. 极速计算当前 Bar 的账户净资产 (PV = Cash + sum(pos * close))
         current_cash = cash_arr[0]
@@ -194,7 +199,8 @@ class Engine:
         strategy: Optional[Callable[[BarContext], None]] = None,
         signals: Optional[np.ndarray] = None,
         amounts: Optional[np.ndarray] = None,
-        data: Union[MarketData, Iterable[MarketData]] = None,
+        data: Union[dict, MarketData, Iterable[MarketData], Any] = None,
+        warmup_steps: int = 0,
     ) -> BacktestResult:
         """
         统一回测运行入口 (Unified Stream-Native Engine Run API)
@@ -202,7 +208,8 @@ class Engine:
         自动支持:
           1. Python 回调策略: engine.run(strategy=my_strat, data=data)
           2. Fast Vectorized 模式: engine.run(signals=signals, amounts=amounts, data=data)
-          3. 磁盘分块流式模式: engine.run(strategy=my_strat, data=scan_chunks(...))
+          3. 统一 Dict / Duck Typing 数据源: engine.run(strategy=my_strat, data={"stock": df, "index": index_df})
+          4. 磁盘分块流式模式: engine.run(strategy=my_strat, data=scan_chunks(...), warmup_steps=10)
         """
         if data is None:
             raise ValueError("Must provide data or data stream generator to engine.run()")
@@ -210,8 +217,14 @@ class Engine:
         # 归一化为 Chunks 流
         if isinstance(data, MarketData):
             chunk_stream = [data]
-        else:
+        elif hasattr(data, "iter_chunks") or (isinstance(data, (Iterable, Iterator, Generator)) and not isinstance(data, (dict, list, tuple, str))):
+            chunk_stream = stream_feed(data)
+        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], MarketData):
             chunk_stream = data
+        else:
+            # 标准字典、DataFrame 或 Duck Typing 对象
+            loaded_data = load_feed(data)
+            chunk_stream = [loaded_data]
 
         all_portfolio_values = []
         all_cash_histories = []
@@ -240,24 +253,28 @@ class Engine:
             state.avg_costs[:] = avg_costs
             cash_arr = np.array([current_cash], dtype=np.float64)
 
+            vol_mat = chunk.volume if chunk.volume is not None else np.zeros((chunk.n_steps, chunk.n_symbols), dtype=np.float64)
+            amt_mat = chunk.amount if chunk.amount is not None else np.zeros((chunk.n_steps, chunk.n_symbols), dtype=np.float64)
+            is_tradable_mat = chunk.is_tradable if chunk.is_tradable is not None else np.ones((chunk.n_steps, chunk.n_symbols), dtype=np.bool_)
+
             if signals is not None and amounts is not None:
                 # 极速向量模式
                 sig_mat = np.ascontiguousarray(signals, dtype=np.int8)
-                amt_mat = np.ascontiguousarray(amounts, dtype=np.float64)
+                amt_matrix = np.ascontiguousarray(amounts, dtype=np.float64)
 
                 adj_open_view = chunk.adj.open if hasattr(chunk, "adj") else chunk.open
+                adj_close_view = chunk.adj.close if hasattr(chunk, "adj") else chunk.close
 
                 run_engine_jit_kernel(
                     open_mat=chunk.open,
                     high_mat=chunk.high,
                     low_mat=chunk.low,
                     close_mat=chunk.close,
-                    raw_close_mat=chunk.raw_close,
-                    volume_mat=chunk.volume,
-                    amount_mat=chunk.amount,
-                    is_tradable_mat=chunk.is_tradable,
+                    volume_mat=vol_mat,
+                    amount_mat=amt_mat,
+                    is_tradable_mat=is_tradable_mat,
                     signals_mat=sig_mat,
-                    amounts_mat=amt_mat,
+                    amounts_mat=amt_matrix,
                     matching_mode=self.matching_mode,
                     fee_rate=self.fee_rate,
                     min_fee=self.min_fee,
@@ -272,17 +289,18 @@ class Engine:
                     trade_count=state.trade_count,
                     max_volume_ratio=self.max_volume_ratio,
                     adj_open_mat=adj_open_view,
+                    adj_close_mat=adj_close_view,
                     long_margin_ratio=self.long_margin_ratio,
                     short_margin_ratio=self.short_margin_ratio,
+                    warmup_steps=warmup_steps,
                 )
-
 
             elif strategy is not None:
                 # Python 回调策略模式
                 orders_buffer = []
                 active_orders = []  # 未成交与跨 Bar 限价单队列
 
-                # 确定使用的收盘价矩阵 (优先使用复权视图计算策略信号)
+                # 确定使用的复权视图
                 close_view = chunk.adj.close if hasattr(chunk, "adj") else chunk.close
                 open_view = chunk.adj.open if hasattr(chunk, "adj") else chunk.open
                 high_view = chunk.adj.high if hasattr(chunk, "adj") else chunk.high
@@ -292,11 +310,10 @@ class Engine:
                     step=0,
                     n_symbols=chunk.n_symbols,
                     timestamps=chunk.timestamps,
-                    open_mat=open_view,
-                    high_mat=high_view,
-                    low_mat=low_view,
-                    close_mat=close_view,
-                    raw_close_mat=chunk.raw_close,
+                    open_mat=chunk.open,
+                    high_mat=chunk.high,
+                    low_mat=chunk.low,
+                    close_mat=chunk.close,
                     adj_close_mat=close_view,
                     adj_open_mat=open_view,
                     adj_high_mat=high_view,
@@ -306,18 +323,22 @@ class Engine:
                     is_tradable_mat=chunk.is_tradable,
                     adj_factor=getattr(chunk, "adj_factor", None),
                     custom_fields=getattr(chunk, "custom_fields", None),
+                    tables=getattr(chunk, "tables", None),
                     positions=state.positions,
                     cash=cash_arr[0],
                     orders_buffer=orders_buffer,
+                    warmup_steps=warmup_steps,
                 )
 
                 for t in range(chunk.n_steps):
+                    is_warmup = (t < warmup_steps)
+
                     # 1. 撤单处理: 从 active_orders 中移除已被标记撤销的订单 ID
                     if ctx.canceled_order_ids:
                         active_orders = [ord_item for ord_item in active_orders if ord_item[0] not in ctx.canceled_order_ids]
 
-                    # 2. 撮合之前的未成交订单 (包括跨 Bar 限价单与 OPEN 模式延迟挂单)
-                    if len(active_orders) > 0:
+                    # 2. 撮合之前的未成交订单 (预热期不撮合)
+                    if not is_warmup and len(active_orders) > 0:
                         remaining_active = []
                         for ord_item in active_orders:
                             oid, otype, side, sym_idx, target_amount, limit_price = ord_item
@@ -390,23 +411,22 @@ class Engine:
                                 )
                         active_orders = remaining_active
 
-                    # 3. 运行当前 Bar 的策略逻辑
+                    # 3. 运行当前 Bar 的策略逻辑 (预热期正常执行，供指标预热)
                     ctx.update_step(t, cash_arr[0])
                     strategy(ctx)
 
-                    # 4. 处理当前 Bar 新产生的订单
-                    if len(orders_buffer) > 0:
+                    # 4. 处理当前 Bar 新产生的订单 (预热期静默丢弃或清空)
+                    if not is_warmup and len(orders_buffer) > 0:
                         for raw_order in orders_buffer:
                             # 规范化订单格式
                             if len(raw_order) == 3:
-                                # 兼容旧格式 (side, sym_idx, target_amount)
                                 side, sym_idx, target_amount = raw_order
                                 oid, otype, limit_price = 0, 0, 0.0
                             else:
                                 oid, otype, side, sym_idx, target_amount, limit_price = raw_order
 
                             if otype == 1:
-                                # 新产生的限价单：首先在当 Bar 进行一次触发判定
+                                # 新产生的限价单
                                 is_trig, exec_p = check_limit_order_triggered_jit(
                                     side,
                                     limit_price,
@@ -442,7 +462,6 @@ class Engine:
                                         short_margin_ratio=self.short_margin_ratio,
                                     )
                                 else:
-                                    # 当 Bar 未能触发，加入 active_orders 留存后续 Bar 匹配
                                     active_orders.append((oid, otype, side, sym_idx, target_amount, limit_price))
 
                             else:
@@ -455,9 +474,9 @@ class Engine:
                                         chunk.open[t, sym_idx],
                                         chunk.high[t, sym_idx],
                                         chunk.low[t, sym_idx],
-                                        chunk.raw_close[t, sym_idx],
-                                        chunk.volume[t, sym_idx],
-                                        chunk.amount[t, sym_idx],
+                                        chunk.close[t, sym_idx],
+                                        vol_mat[t, sym_idx],
+                                        amt_mat[t, sym_idx],
                                     )
                                     adj_p = get_execution_price(
                                         self.matching_mode,
@@ -465,8 +484,8 @@ class Engine:
                                         high_view[t, sym_idx],
                                         low_view[t, sym_idx],
                                         close_view[t, sym_idx],
-                                        chunk.volume[t, sym_idx],
-                                        chunk.amount[t, sym_idx],
+                                        vol_mat[t, sym_idx],
+                                        amt_mat[t, sym_idx],
                                     )
                                     vol_val = chunk.volume[t, sym_idx] if chunk.volume is not None else 0.0
 
@@ -492,21 +511,24 @@ class Engine:
                                         short_margin_ratio=self.short_margin_ratio,
                                     )
                         orders_buffer.clear()
+                    else:
+                        orders_buffer.clear()
 
-                    # 5. 扣除每日融资利息与融券利息 (如果设置了利率)
-                    daily_margin_r = self.margin_interest_rate / 252.0
-                    daily_borrow_r = self.borrow_interest_rate / 252.0
+                    # 5. 扣除每日融资利息与融券利息 (非预热期且设置了利率)
+                    if not is_warmup:
+                        daily_margin_r = self.margin_interest_rate / 252.0
+                        daily_borrow_r = self.borrow_interest_rate / 252.0
 
-                    if cash_arr[0] < 0.0 and daily_margin_r > 0.0:
-                        cash_arr[0] -= abs(cash_arr[0]) * daily_margin_r
+                        if cash_arr[0] < 0.0 and daily_margin_r > 0.0:
+                            cash_arr[0] -= abs(cash_arr[0]) * daily_margin_r
 
-                    if daily_borrow_r > 0.0:
-                        for i in range(chunk.n_symbols):
-                            if state.positions[i] < 0.0:
-                                curr_price = chunk.close[t, i]
-                                if not np.isnan(curr_price) and curr_price > 0:
-                                    short_val = abs(state.positions[i]) * curr_price
-                                    cash_arr[0] -= short_val * daily_borrow_r
+                        if daily_borrow_r > 0.0:
+                            for i in range(chunk.n_symbols):
+                                if state.positions[i] < 0.0:
+                                    curr_price = chunk.close[t, i]
+                                    if not np.isnan(curr_price) and curr_price > 0:
+                                        short_val = abs(state.positions[i]) * curr_price
+                                        cash_arr[0] -= short_val * daily_borrow_r
 
                     state.cash = cash_arr[0]
                     state.cash_history[t] = state.cash
@@ -561,10 +583,10 @@ class Engine:
         self,
         signals: np.ndarray,
         amounts: np.ndarray,
-        data: Union[MarketData, Iterable[MarketData]],
+        data: Union[dict, MarketData, Iterable[MarketData], Any],
+        warmup_steps: int = 0,
     ) -> BacktestResult:
         """
         向后兼容的向量化快捷运行方法
         """
-        return self.run(signals=signals, amounts=amounts, data=data)
-
+        return self.run(signals=signals, amounts=amounts, data=data, warmup_steps=warmup_steps)

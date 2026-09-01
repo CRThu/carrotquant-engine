@@ -37,7 +37,6 @@ def test_bar_context_bound_checking():
         high_mat=open_p,
         low_mat=open_p,
         close_mat=close_p,
-        raw_close_mat=close_p,
         volume_mat=open_p,
         amount_mat=open_p,
         is_tradable_mat=is_t,

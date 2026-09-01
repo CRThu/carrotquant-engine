@@ -5,8 +5,20 @@
 """
 
 from typing import Dict, List, Any
+from datetime import datetime, timezone
 import numpy as np
 import polars as pl
+
+
+def _format_ts_str(val: Any) -> str:
+    """将时间戳 (int64 ms 或 string) 转换为可读格式字符串"""
+    if isinstance(val, (int, np.integer)):
+        try:
+            dt = datetime.fromtimestamp(int(val) / 1000.0, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(val)
+    return str(val)
 
 
 class BacktestResult:
@@ -40,7 +52,7 @@ class BacktestResult:
             step_indices = valid_trades[:, 0].astype(int)
             stock_indices = valid_trades[:, 1].astype(int)
 
-            trade_datetimes = [str(timestamps[i]) for i in step_indices]
+            trade_datetimes = [_format_ts_str(timestamps[i]) for i in step_indices]
             trade_symbols = [symbols[i] for i in stock_indices]
             side_strs = ["BUY" if s > 0 else "SELL" for s in valid_trades[:, 2]]
 
@@ -68,7 +80,7 @@ class BacktestResult:
 
         # 构建资产曲线 DataFrame
         self.portfolio_df = pl.DataFrame({
-            "datetime": [str(t) for t in timestamps],
+            "datetime": [_format_ts_str(t) for t in timestamps],
             "cash": cash_history,
             "portfolio_value": portfolio_value,
         })

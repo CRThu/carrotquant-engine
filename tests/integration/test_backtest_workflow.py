@@ -43,7 +43,7 @@ def test_full_backtest_workflow():
         if ctx.step < 5:
             return
 
-        for i in range(ctx.n_stocks):
+        for i in range(ctx.n_symbols):
             if not ctx.is_tradable[i]:
                 continue
             history_close = ctx.close_history[-5:, i]
@@ -52,10 +52,10 @@ def test_full_backtest_workflow():
 
             # 价格低于 5日均线 并且未持仓，则买入 100 股
             if curr_p < ma5 and ctx.positions[i] == 0:
-                ctx.buy(stock_idx=i, amount=100)
+                ctx.buy(symbol_idx=i, amount=100)
             # 价格高于 5日均线 并且有持仓，则卖出
             elif curr_p > ma5 and ctx.positions[i] > 0:
-                ctx.sell(stock_idx=i, amount=ctx.positions[i])
+                ctx.sell(symbol_idx=i, amount=ctx.positions[i])
 
     engine = Engine(initial_cash=100_000.0, fee_rate=0.0003, min_fee=5.0)
     results = engine.run(strategy=mean_reversion_strategy, data=data)
