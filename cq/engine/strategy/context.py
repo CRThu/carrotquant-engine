@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from datetime import datetime, timezone
 import numpy as np
 
-from cq.engine.utils.time_utils import ts_to_iso_str
+from cq.engine.utils.time_utils import ts_to_iso_str, parse_date_to_ms
 from cq.engine.feed.matrix_builder import (
     EventSnapshot,
     SparseEventContainer,
@@ -261,14 +261,19 @@ class BarContext:
         custom_fields: Optional[Any] = None,
         tables: Optional[Dict[str, Any]] = None,
         positions: Optional[np.ndarray] = None,
+        available_positions: Optional[np.ndarray] = None,
         cash: float = 0.0,
         orders_buffer: Optional[List] = None,
         warmup_steps: int = 0,
+        symbols: Optional[List[str]] = None,
+        order_counter_ref: Optional[List[int]] = None,
     ):
         self.step = step
         self.n_symbols = n_symbols
         self._timestamps = timestamps
         self.warmup_steps = warmup_steps
+        self.symbols: List[str] = list(symbols) if symbols is not None else [f"SYM_{i}" for i in range(n_symbols)]
+        self._symbol_to_idx: Dict[str, int] = {s: i for i, s in enumerate(self.symbols)}
 
         self._open_mat = open_mat
         self._high_mat = high_mat
@@ -303,11 +308,12 @@ class BarContext:
 
         # 账户状态
         self.positions = positions
+        self.available_positions = available_positions if available_positions is not None else positions
         self.cash = cash
 
-        # 下单指令缓冲 [(order_id, order_type, side, symbol_idx, amount, price), ...]
+        # 下单指令缓冲 [(order_id, order_type, side, symbol_idx, amount, price, is_adj), ...]
         self.orders_buffer = orders_buffer if orders_buffer is not None else []
-        self._order_counter = 0
+        self._order_counter_ref = order_counter_ref if order_counter_ref is not None else [0]
         self.canceled_order_ids = set()
 
         # 复权子视角
@@ -318,10 +324,47 @@ class BarContext:
         """是否处于预热期"""
         return self.step < self.warmup_steps
 
-    def update_step(self, step: int, cash: float):
+    @property
+    def portfolio_value(self) -> float:
+        """当前时间步的实时预估账户总资产 (Cash + sum(pos * close))"""
+        pos_val = 0.0
+        if self.positions is not None:
+            for i in range(self.n_symbols):
+                if self.positions[i] != 0.0:
+                    curr_p = self.close[i]
+                    if not np.isnan(curr_p) and curr_p > 0:
+                        pos_val += self.positions[i] * curr_p
+        return float(self.cash + pos_val)
+
+    def get_symbol_idx(self, symbol: Union[str, int, np.integer]) -> int:
+        """解析标的代码（如 '000001.SZ'）或整数序号为矩阵列索引"""
+        if isinstance(symbol, (int, np.integer)):
+            idx = int(symbol)
+            if 0 <= idx < self.n_symbols:
+                return idx
+            raise IndexError(f"标的索引 {idx} 超出范围 [0, {self.n_symbols - 1}]。")
+        if isinstance(symbol, str):
+            if symbol in self._symbol_to_idx:
+                return self._symbol_to_idx[symbol]
+            raise KeyError(f"标的代码 '{symbol}' 不在当前 Universe 中。可用标的: {self.symbols[:5]}...")
+        raise TypeError(f"无法识别的标的类型: {type(symbol)}")
+
+    def get_position(self, symbol: Union[str, int]) -> float:
+        """获取指定标的的当前持仓股数"""
+        idx = self.get_symbol_idx(symbol)
+        return float(self.positions[idx]) if self.positions is not None else 0.0
+
+    def get_available_position(self, symbol: Union[str, int]) -> float:
+        """获取指定标的的当前可卖持仓股数 (支持 T+1 约束)"""
+        idx = self.get_symbol_idx(symbol)
+        return float(self.available_positions[idx]) if self.available_positions is not None else 0.0
+
+    def update_step(self, step: int, cash: float, available_positions: Optional[np.ndarray] = None):
         """在主循环中原地更新时间步与指针"""
         self.step = step
         self.cash = cash
+        if available_positions is not None:
+            self.available_positions = available_positions
         self.orders_buffer.clear()
         self.canceled_order_ids.clear()
 
@@ -393,7 +436,7 @@ class BarContext:
         val = self._timestamps[self.step]
         if isinstance(val, (int, np.integer)):
             return int(val)
-        return int(val)
+        return parse_date_to_ms(val)
 
     @property
     def datetime(self) -> str:
@@ -407,37 +450,114 @@ class BarContext:
         """单标的快捷当前收盘价"""
         return float(self.close[0])
 
-    def buy(self, symbol_idx: int = 0, amount: float = 0.0) -> int:
-        """挂买入市价单 (pos += amount)"""
+    def buy(
+        self,
+        symbol: Union[str, int, None] = None,
+        amount: float = 0.0,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
+        """挂买入市价单 (pos += amount，支持股票代码字符串如 '000001.SZ' 或整数序号)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
         if amount > 0:
-            self.orders_buffer.append((1, symbol_idx, float(amount)))
+            self.orders_buffer.append((1, sym_idx, float(amount)))
             return 0
         return 0
 
-    def sell(self, symbol_idx: int = 0, amount: float = 0.0) -> int:
+    def sell(
+        self,
+        symbol: Union[str, int, None] = None,
+        amount: float = 0.0,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
         """挂卖出市价单 (pos -= amount，天然支持做空)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
         if amount > 0:
-            self.orders_buffer.append((-1, symbol_idx, float(amount)))
+            self.orders_buffer.append((-1, sym_idx, float(amount)))
             return 0
         return 0
 
-    def buy_limit(self, symbol_idx: int = 0, amount: float = 0.0, price: float = 0.0) -> int:
+    def buy_limit(
+        self,
+        symbol: Union[str, int, None] = None,
+        amount: float = 0.0,
+        price: float = 0.0,
+        is_adj: bool = True,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
         """挂买入限价单 (当市场最低价 <= limit_price 时触发买入)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
         if amount > 0 and price > 0:
-            self._order_counter += 1
-            order_id = self._order_counter
-            self.orders_buffer.append((order_id, 1, 1, symbol_idx, float(amount), float(price)))
+            self._order_counter_ref[0] += 1
+            order_id = self._order_counter_ref[0]
+            self.orders_buffer.append((order_id, 1, 1, sym_idx, float(amount), float(price), is_adj))
             return order_id
         return 0
 
-    def sell_limit(self, symbol_idx: int = 0, amount: float = 0.0, price: float = 0.0) -> int:
+    def sell_limit(
+        self,
+        symbol: Union[str, int, None] = None,
+        amount: float = 0.0,
+        price: float = 0.0,
+        is_adj: bool = True,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
         """挂卖无限价单 (当市场最高价 >= limit_price 时触发卖出)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
         if amount > 0 and price > 0:
-            self._order_counter += 1
-            order_id = self._order_counter
-            self.orders_buffer.append((order_id, 1, -1, symbol_idx, float(amount), float(price)))
+            self._order_counter_ref[0] += 1
+            order_id = self._order_counter_ref[0]
+            self.orders_buffer.append((order_id, 1, -1, sym_idx, float(amount), float(price), is_adj))
             return order_id
         return 0
+
+    def order_target_amount(
+        self,
+        symbol: Union[str, int, None] = None,
+        target_amount: float = 0.0,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
+        """调整标的持仓至目标股数 (Target Amount Rebalance)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
+        curr_pos = float(self.positions[sym_idx]) if self.positions is not None else 0.0
+        diff = float(target_amount) - curr_pos
+        if diff > 1e-8:
+            return self.buy(sym_idx, diff)
+        elif diff < -1e-8:
+            return self.sell(sym_idx, abs(diff))
+        return 0
+
+    def order_target_value(
+        self,
+        symbol: Union[str, int, None] = None,
+        target_val: float = 0.0,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
+        """调整标的持仓至目标市值金额 (Target Value Rebalance)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
+        curr_price = float(self.close[sym_idx])
+        if np.isnan(curr_price) or curr_price <= 0:
+            return 0
+        target_shares = float(target_val) / curr_price
+        return self.order_target_amount(sym_idx, target_shares)
+
+    def order_target_percent(
+        self,
+        symbol: Union[str, int, None] = None,
+        target_pct: float = 0.0,
+        symbol_idx: Optional[int] = None,
+    ) -> int:
+        """调整标的持仓至目标资产百分比 (Target Percent Rebalance, 例如 0.1 表示 10%)"""
+        target_sym = symbol if symbol is not None else (symbol_idx if symbol_idx is not None else 0)
+        sym_idx = self.get_symbol_idx(target_sym)
+        total_pv = self.portfolio_value
+        target_val = total_pv * float(target_pct)
+        return self.order_target_value(sym_idx, target_val)
 
     def cancel_order(self, order_id: int):
         """撤销指定 ID 的未成交订单"""

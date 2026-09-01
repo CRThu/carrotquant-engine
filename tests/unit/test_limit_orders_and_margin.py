@@ -146,8 +146,8 @@ def test_margin_interest_rate(sample_market_data):
     # 验证每日产生的融资利息已被从 cash_history 中扣除
     daily_r = 0.063 / 252.0
     expected_daily_interest = 50_000.0 * daily_r
-    # 步 0 产生交易后，第 0 步末 cash 为 -50000 - expected_daily_interest
-    assert res.cash_history[0] == pytest.approx(-50_000.0 - expected_daily_interest, rel=1e-5)
+    # 步 0 产生交易后，第 1 步 (次日跨日结算) cash 为 -50000 - expected_daily_interest
+    assert res.cash_history[1] == pytest.approx(-50_000.0 - expected_daily_interest, rel=1e-5)
 
 
 def test_borrow_interest_rate(sample_market_data):
@@ -175,4 +175,5 @@ def test_borrow_interest_rate(sample_market_data):
     # 第 0 步做空持仓 1000 股，收盘价 10.0 -> 做空市值 10,000
     daily_borrow_r = 0.084 / 252.0
     expected_borrow_fee = 10_000.0 * daily_borrow_r
-    assert res.cash_history[0] == pytest.approx(110_000.0 - expected_borrow_fee, rel=1e-5)
+    # 第 1 步 (次日跨日结算) cash 扣除 1 日融券利息
+    assert res.cash_history[1] == pytest.approx(110_000.0 - expected_borrow_fee, rel=1e-5)

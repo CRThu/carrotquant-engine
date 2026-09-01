@@ -19,6 +19,7 @@ from cq.engine.feed.matrix_builder import (
     SparseEventContainer,
     StaticAttributeContainer,
 )
+from cq.engine.feed.chunk_streamer import ChunkStreamer
 
 
 class TableSpec:
@@ -219,7 +220,6 @@ def stream_feed(
         for chunk in data:
             yield load_feed(chunk, columns=columns, symbols=symbols)
     elif isinstance(data, MarketData):
-        from cq.engine.feed.chunk_streamer import ChunkStreamer
         streamer = ChunkStreamer(data, chunk_size=1000)
         for _, _, chunk in streamer.iter_chunks():
             yield chunk

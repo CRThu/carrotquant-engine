@@ -289,12 +289,13 @@ class EventSnapshot:
     def __init__(self, events: Dict[str, Any], symbol_to_idx: Dict[str, int]):
         self._events = events  # {symbol: row_dict_or_data}
         self._symbol_to_idx = symbol_to_idx
+        self._idx_to_sym: Dict[int, str] = {idx: sym for sym, idx in symbol_to_idx.items()}
 
     def get(self, key: Union[str, int], default: Any = None) -> Any:
         if isinstance(key, (int, np.integer)):
-            for sym, idx in self._symbol_to_idx.items():
-                if idx == key:
-                    return self._events.get(sym, default)
+            sym = self._idx_to_sym.get(int(key))
+            if sym is not None:
+                return self._events.get(sym, default)
             return default
         return self._events.get(key, default)
 
@@ -303,10 +304,8 @@ class EventSnapshot:
 
     def __contains__(self, key: Union[str, int]) -> bool:
         if isinstance(key, (int, np.integer)):
-            for sym, idx in self._symbol_to_idx.items():
-                if idx == key:
-                    return sym in self._events
-            return False
+            sym = self._idx_to_sym.get(int(key))
+            return sym in self._events if sym is not None else False
         return key in self._events
 
     def __len__(self) -> int:
@@ -359,13 +358,38 @@ class StaticAttributeContainer:
     """
     静态属性映射容器 (StaticAttributeContainer)
     存储行业、概念板块等无时间轴静态映射，未分类标的查询返回 None。
-    支持一对多列表聚合 (如概念列表)。
+    支持一对多列表聚合 (如概念列表)，并内置反向索引 (属性/概念 -> 标的代码列表)。
     """
 
     def __init__(self, mapping: Dict[str, Any], all_symbols: List[str]):
         self._mapping = mapping
         self._all_symbols = all_symbols
         self._symbol_to_idx = {s: i for i, s in enumerate(all_symbols)}
+        self._reverse_mapping: Dict[str, List[str]] = {}
+        self._build_reverse_index()
+
+    def _build_reverse_index(self):
+        """构建属性值到标的代码列表的反向哈希映射"""
+        for sym, val in self._mapping.items():
+            if isinstance(val, (str, int, float)):
+                key_str = str(val)
+                self._reverse_mapping.setdefault(key_str, []).append(sym)
+            elif isinstance(val, (list, tuple, set)):
+                for item in val:
+                    if isinstance(item, (str, int, float)):
+                        self._reverse_mapping.setdefault(str(item), []).append(sym)
+                    elif isinstance(item, dict):
+                        for sub_v in item.values():
+                            if isinstance(sub_v, (str, int, float)):
+                                self._reverse_mapping.setdefault(str(sub_v), []).append(sym)
+            elif isinstance(val, dict):
+                for sub_v in val.values():
+                    if isinstance(sub_v, (str, int, float)):
+                        self._reverse_mapping.setdefault(str(sub_v), []).append(sym)
+
+    def get_symbols(self, attribute_val: Any) -> List[str]:
+        """根据属性值（如行业名、概念板块名）反向查询属于该分类的全部标的代码列表"""
+        return self._reverse_mapping.get(str(attribute_val), [])
 
     def get(self, key: Union[str, int], default: Any = None) -> Any:
         if isinstance(key, (int, np.integer)):
@@ -398,7 +422,7 @@ class StaticAttributeContainer:
         return self._mapping.values()
 
     def __repr__(self) -> str:
-        return f"<StaticAttributeContainer: {len(self._mapping)} symbols mapped>"
+        return f"<StaticAttributeContainer: {len(self._mapping)} symbols mapped, {len(self._reverse_mapping)} attributes>"
 
 
 # 单点权威时间序列提取别名 (向后兼容)

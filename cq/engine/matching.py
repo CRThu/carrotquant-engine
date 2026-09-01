@@ -117,9 +117,10 @@ def execute_trade_jit(
     max_volume_ratio: float = 1.0,
     long_margin_ratio: float = 1.0,
     short_margin_ratio: float = 1.0,
+    lot_size: int = 1,
 ) -> bool:
     """
-    JIT 极速撮合单笔交易 (支持多空双向、盘口成交量限制及做多/做空保证金率校验)。
+    JIT 极速撮合单笔交易 (支持多空双向、盘口成交量限制、做多/做空保证金率校验及整手约束)。
 
     Returns:
         bool: 是否成功成交
@@ -127,9 +128,17 @@ def execute_trade_jit(
     if target_amount <= 0.0 or np.isnan(raw_price) or raw_price <= 0.0:
         return False
 
+    # 买入整手约束 (Lot Size Constraint)
+    if side == 1 and lot_size > 1:
+        target_amount = np.floor(target_amount / lot_size) * lot_size
+        if target_amount <= 0.0:
+            return False
+
     # 盘口成交量上限约束 (Max Volume Ratio Constraint)
     if volume > 0.0 and max_volume_ratio < 1.0:
         max_tradable = volume * max_volume_ratio
+        if side == 1 and lot_size > 1:
+            max_tradable = np.floor(max_tradable / lot_size) * lot_size
         if target_amount > max_tradable:
             target_amount = max_tradable
             if target_amount <= 0.0:
@@ -161,6 +170,8 @@ def execute_trade_jit(
             if denom <= 0.0:
                 return False
             target_amount = (current_cash - min_fee) / denom
+            if lot_size > 1:
+                target_amount = np.floor(target_amount / lot_size) * lot_size
             if target_amount <= 0.0:
                 return False
             raw_trade_value = target_amount * exec_raw_price
@@ -191,13 +202,41 @@ def execute_trade_jit(
         total_fee = comm + duty
         net_proceeds = raw_trade_value - total_fee
 
-        # 卖空加仓保证金校验: 若属于新建/增加空头持仓
+        # 卖空/反手空头保证金校验
         if curr_pos <= 0.0:
+            # 纯加空/新开空
             req_short_margin = raw_trade_value * short_margin_ratio + total_fee
             if req_short_margin > current_cash and short_margin_ratio > 0:
                 if current_cash <= total_fee:
                     return False
                 target_amount = (current_cash - total_fee) / (exec_raw_price * short_margin_ratio)
+                if target_amount <= 0.0:
+                    return False
+                raw_trade_value = target_amount * exec_raw_price
+                comm = max(raw_trade_value * fee_rate, min_fee) if fee_rate > 0 else 0.0
+                duty = raw_trade_value * stamp_duty
+                total_fee = comm + duty
+                net_proceeds = raw_trade_value - total_fee
+        elif target_amount > curr_pos:
+            # 此前为多头，卖出量大于多头持仓 -> 多翻空反手
+            short_part = target_amount - curr_pos
+            close_part = curr_pos
+            close_val = close_part * exec_raw_price
+            close_comm = max(close_val * fee_rate, min_fee) if fee_rate > 0 else 0.0
+            close_duty = close_val * stamp_duty
+            close_net = close_val - (close_comm + close_duty)
+            cash_after_close = current_cash + close_net
+
+            short_val = short_part * exec_raw_price
+            short_comm = max(short_val * fee_rate, 0.0)
+            short_duty = short_val * stamp_duty
+            req_short_margin = short_val * short_margin_ratio + (short_comm + short_duty)
+
+            if req_short_margin > cash_after_close and short_margin_ratio > 0:
+                max_short = (cash_after_close - min_fee) / (exec_raw_price * short_margin_ratio)
+                if max_short < 0.0:
+                    max_short = 0.0
+                target_amount = curr_pos + max_short
                 if target_amount <= 0.0:
                     return False
                 raw_trade_value = target_amount * exec_raw_price
